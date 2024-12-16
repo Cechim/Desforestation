@@ -6,3 +6,234 @@ This repository organizes the codes for desforestation in GEE
 Requisites:
 
 Google Earth Engine (GEE)
+
+//var Parana = ee.FeatureCollection('ft:1NSQM1D4NTLvwwtmgGURAcrQVHbJUKOfEAUdo0Tx_')  
+//var MunicipiosPR = ee.FeatureCollection('ft:1VAPOKdnLMybu4rFz5KoKxM-AJ_abQOnTYj90ZtS5')  
+//var Perimetro_Urbano = ee.FeatureCollection('ft:1yrq1-VPY0RXwkWzLkJkpTFaCUtUQSDZCKp0dxV37')
+//var MunicipiosPR = MunicipiosPR.filter(ee.Filter.eq('Nomes', 'BITURUNA'));
+//var Bituruna = CAR.filter(ee.Filter.eq('municipio', 'Bituruna'));
+
+var messoregiao = PR
+var messoreg = PR
+
+//var ImoveisCAR = CAR.filterBounds(messoreg);
+
+var S2 = ee.ImageCollection('COPERNICUS/S2').filterBounds(messoreg).filterDate('2023-01-01', '2023-12-30')
+.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
+
+var Sentinel = S2.median().clip(messoreg);
+var Sentinel2 = Sentinel.clipToCollection(messoreg).select(['B2', 'B3', 'B4', 'B5', 'B6', 'B8', 'B11', 'B12']);
+var Sentinel_2 = Sentinel.clipToCollection(messoreg).select(['B2', 'B3', 'B4', 'B8', 'B11']);
+
+// Normalized Difference Water Index (NDWI)
+var ndwi = Sentinel2.normalizedDifference(['B8', 'B2']);
+var ndwi = ndwi.lt(0).clip(messoreg);
+
+var vis = { min: -1, max: 1, palette: [
+      'FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718',
+      '74A901', '66A000', '529400', '3E8601', '207401', '056201',
+      '004C00', '023B01', '012E01', '011D01', '011301']};
+
+//Map.addLayer(ndwi, vis, 'NDWI');
+var rgbVis = {
+  min: 1550,
+  max: 4254,
+  gamma: 0.9,
+  bands: ['B8', 'B11', 'B4']
+};
+//var visParams = {bands: ['B4', 'B3', 'B2'], min: 349, max: 1201};
+var visParams = {bands: ['B8', 'B11', 'B4'], min: 1387.7, max: 4181.7};
+Map.addLayer(Sentinel_2, rgbVis, 'Mosaic Composite');
+
+//var roi = ee.Geometry.Point([-51.907117366790715,-26.20371389110482]);
+//var Desmatamento_2019 = Desmatamento_2019.filter(ee.Filter.eq('Classes', 'Remocao Floresta Nativa'));
+Map.centerObject(messoreg, 10);
+  
+// This field contains UNIX time in milliseconds.
+var timeField = 'system:time_start';
+
+// Use this function to mask clouds in Sentinel 2 imagery.
+var maskClouds = function(image) {
+  var qa = image.select('QA60')
+var cloudBitMask = ee.Number(2).pow(10).int()
+var cirrusBitMask = ee.Number(2).pow(11).int()
+var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(qa.bitwiseAnd(cirrusBitMask).eq(0))
+return image.updateMask(mask).divide(10000).select("B.*").copyProperties(image, ["system:time_start"])};
+
+// Use this function to add variables for NDVI, time and a constant to Sentinel 2 imagery.
+var addVariables = function(image) {
+  // Compute time in fractional years since the epoch.
+  var date = ee.Date(image.get(timeField));
+  var years = date.difference(ee.Date('2023-01-01'), 'year');
+  // Return the image with the added bands.
+  return image
+    // Add an NDVI band.
+    .addBands(image.normalizedDifference(['B8', 'B4']).rename('NDVI')).float()
+    // Add a time band.
+    .addBands(ee.Image(years).rename('t').float())
+    // Add a constant band.
+    .addBands(ee.Image.constant(1));};
+
+// Remove clouds, add variables and filter to the area of interest.
+var filteredSentinel = S2
+  .filterBounds(messoreg)
+  .map(maskClouds)
+  .map(addVariables);
+
+// Plot a time series of NDVI at a single location.
+var l8Chart = ui.Chart.image.series(filteredSentinel.select('NDVI'), roi)
+    .setChartType('ScatterChart')
+    .setOptions({
+      title: 'Sentinel 2 NDVI time series at ROI',
+      trendlines: {0: {
+        color: 'CC0000'
+      }},
+      lineWidth: 1,
+      pointSize: 3,
+    });
+print(l8Chart);
+
+// Linear trend ----------------------------------------------------------------
+// List of the independent variable names
+var independents = ee.List(['constant', 't']);
+
+// Name of the dependent variable.
+var dependent = ee.String('NDVI');
+
+// Compute a linear trend.  This will have two bands: 'residuals' and 
+// a 2x1 band called coefficients (columns are for dependent variables).
+var trend = filteredSentinel.select(independents.add(dependent))
+    .reduce(ee.Reducer.linearRegression(independents.length(), 1));
+// Map.addLayer(trend, {}, 'trend array image');
+
+// Flatten the coefficients into a 2-band image
+var coefficients = trend.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([independents]);
+
+// Compute a de-trended series.
+var detrended = filteredSentinel.map(function(image) {
+  return image.select(dependent).subtract(
+          image.select(independents).multiply(coefficients).reduce('sum'))
+          .rename(dependent)
+          .copyProperties(image, [timeField]);
+});
+
+// Plot the detrended results.
+var detrendedChart = ui.Chart.image.series(detrended, roi, null, 10)
+    .setOptions({
+      title: 'Detrended Sentinel time series at ROI',
+      lineWidth: 1,
+      pointSize: 3,
+    });
+print(detrendedChart);
+
+// Harmonic trend ----------------------------------------------------------------
+// Use these independent variables in the harmonic regression.
+var harmonicIndependents = ee.List(['constant', 't', 'cos', 'sin']);
+
+// Add harmonic terms as new image bands.
+var harmonicSentinel = filteredSentinel.map(function(image) {
+  var timeRadians = image.select('t').multiply(2 * Math.PI);
+  return image
+    .addBands(timeRadians.cos().rename('cos'))
+    .addBands(timeRadians.sin().rename('sin'));
+});
+  
+// The output of the regression reduction is a 4x1 array image.
+var harmonicTrend = harmonicSentinel
+  .select(harmonicIndependents.add(dependent))
+  .reduce(ee.Reducer.linearRegression(harmonicIndependents.length(), 1));
+
+// Turn the array image into a multi-band image of coefficients.
+var harmonicTrendCoefficients = harmonicTrend.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([harmonicIndependents]);
+
+// Compute fitted values.
+var fittedHarmonic = harmonicSentinel.map(function(image) {
+  return image.addBands(
+    image.select(harmonicIndependents)
+      .multiply(harmonicTrendCoefficients)
+      .reduce('sum')
+      .rename('fitted'));
+});
+
+// Plot the fitted model and the original data at the ROI.
+print(ui.Chart.image.series(
+  fittedHarmonic.select(['fitted','NDVI']), roi, ee.Reducer.mean(), 10)
+    .setSeriesNames(['NDVI', 'fitted'])
+    .setOptions({
+      title: 'Harmonic model: original and fitted values',
+      lineWidth: 1,
+      pointSize: 3,
+}));
+
+// Compute phase and amplitude.
+var phase = harmonicTrendCoefficients.select('cos').atan2(
+            harmonicTrendCoefficients.select('sin'));
+            
+var amplitude = harmonicTrendCoefficients.select('cos').hypot(
+                harmonicTrendCoefficients.select('sin'));
+
+// Use the HSV to RGB transform to display phase and amplitude
+var rgb = phase.unitScale(-Math.PI, Math.PI).addBands(
+          amplitude.multiply(2.5)).addBands(
+          ee.Image(1)).hsvToRgb().clip(messoreg);
+
+Map.addLayer(rgb, {}, 'phase (hue), amplitude (saturation)');
+print(rgb);
+
+
+var NDVI_min = Sentinel2.normalizedDifference(['B8', 'B4']).reduce('min').clip(messoreg);
+
+
+var ndvi = harmonicSentinel.select('NDVI').reduce('min').clip(messoreg);
+var red = rgb.select(['red']);
+var green = rgb.select(['green']);
+var blue = rgb.select(['blue']);
+
+var selection = red.eq(1) && green.lt(0.5) && blue.lt(0.7).selfMask().rename('Detection_change');
+
+var empty = ee.Image().byte();
+//var outline2 = empty.paint({featureCollection: Floresta, color: 1,width: 1});
+//var outline = empty.paint({featureCollection: Municipios, color: 1,width: 1});
+//var outline1 = empty.paint({featureCollection: ImoveisCAR, color: 1,width: 1});
+//var outline2 = empty.paint({featureCollection: Floresta, color: 1,width: 1});
+var outline3 = empty.paint({featureCollection: messoreg, color: 1,width: 1});
+
+//Map.addLayer(ndvi, {}, 'NDVI');
+//Map.addLayer(NDVI_min, {}, 'NDVI_min');
+Map.addLayer(selection, {palette: 'FF0000'}, 'Desforestation');
+//Map.addLayer(outline2, {palette: 'FF0000'}, 'Floresta');
+//Map.addLayer(outline1, {palette: '#020f1c'}, 'Imóveis CAR');
+//Map.addLayer(outline2, {palette: '#020f1c'}, 'Floresta');
+//Map.addLayer(outline, {palette: 'FF0000'}, 'Municipios');
+//Map.addLayer(outline3, {palette: 'FF0000'}, 'Messoregiao');
+
+//var desmat = rgb.lt(0.9);
+//var desmat = rgb.eq(1) && rgb.lt(0.6);
+//print(desmat)
+//Map.addLayer(desmat, {}, 'Desmatamento');
+
+Export.image.toDrive({
+  image:selection.select(['Desforestation']),
+  description: 'Parana_rgb_red',
+  folder: 'Desforestation_2023',
+  scale: 10,
+  region: Tile,
+  fileFormat: 'GeoTIFF',
+  formatOptions: {cloudOptimized: true}, maxPixels: 1000000000000});
+  
+  
+  
+var rgb = rgb.clipToCollection(messoreg).select(['red', 'green', 'blue']);
+
+Export.image.toDrive({
+  image:Sentinel_2,
+  description: 'Sentinel2_rgb_2023',
+  folder: 'Sentinel2_2023',
+  scale: 10,
+  region: Tile,
+  fileFormat: 'GeoTIFF',
+  formatOptions: {cloudOptimized: true}, maxPixels: 1000000000000});
